@@ -1,0 +1,27 @@
+version: 2
+
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+
+  - package-ecosystem: cargo
+    directories:
+      - /
+      - /lsp
+    ignore:
+      - dependency-name: microtypo-core
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+
+  - package-ecosystem: rust-toolchain
+    directory: /lsp
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7

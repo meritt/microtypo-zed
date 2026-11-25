@@ -1,0 +1,275 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - v*
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  identity:
+    name: Identity
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      source_commit: ${{ steps.identity.outputs.source_commit }}
+    env:
+      REF: ${{ github.ref_name }}
+      EVENT_COMMIT: ${{ github.sha }}
+      WORKFLOW_COMMIT: ${{ github.workflow_sha }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Identity
+        id: identity
+        run: |
+          if [[ ! "$REF" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::release ref is not a canonical vMAJOR.MINOR.PATCH"
+            exit 1
+          fi
+          source_commit="$(git rev-parse "refs/tags/$REF^{commit}")"
+          main_commit="$(git rev-parse 'refs/remotes/origin/main^{commit}')"
+          if [ "$source_commit" != "$(git rev-parse 'HEAD^{commit}')" ] ||
+             [ "$source_commit" != "$(git rev-parse "$EVENT_COMMIT^{commit}")" ] ||
+             [ "$source_commit" != "$WORKFLOW_COMMIT" ] ||
+             ! git merge-base --is-ancestor "$source_commit" "$main_commit"; then
+            echo "::error::tag, source, workflow, or main identity differs"
+            exit 1
+          fi
+          for manifest in Cargo.toml lsp/Cargo.toml extension.toml; do
+            declared="$(sed -n 's/^version = "\(.*\)"$/\1/p' "$manifest" | head -n 1)"
+            if [ "v$declared" != "$REF" ]; then
+              echo "::error::a manifest version differs from the release ref"
+              exit 1
+            fi
+          done
+          echo "source_commit=$source_commit" >> "$GITHUB_OUTPUT"
+
+  gates:
+    name: Gates
+    needs: identity
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    name: Build
+    needs: identity
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { runner: macos-26, target: aarch64-apple-darwin, asset: darwin-arm64, native: true }
+          - { runner: macos-26, target: x86_64-apple-darwin, asset: darwin-x64, native: false }
+          - { runner: ubuntu-26.04, target: x86_64-unknown-linux-musl, asset: linux-x64, native: true }
+          - { runner: ubuntu-26.04-arm, target: aarch64-unknown-linux-musl, asset: linux-arm64, native: true }
+          - { runner: windows-2025, target: x86_64-pc-windows-msvc, asset: windows-x64, suffix: .exe, native: true }
+          - { runner: windows-11-arm, target: aarch64-pc-windows-msvc, asset: windows-arm64, suffix: .exe, native: true }
+    env:
+      CARGO_INCREMENTAL: 0
+      TARGET: ${{ matrix.target }}
+      ASSET: microtypo-lsp-${{ matrix.asset }}${{ matrix.suffix }}
+      BINARY: lsp/target/${{ matrix.target }}/release/microtypo-lsp${{ matrix.suffix }}
+      REF: ${{ github.ref_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup
+        run: |
+          channel="$(sed -n 's/^channel = "\(.*\)"$/\1/p' lsp/rust-toolchain.toml | tr -d '\r')"
+          rustup toolchain install "$channel" --profile minimal --target "$TARGET"
+          echo "RUSTUP_TOOLCHAIN=$channel" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: cargo build --release --locked --manifest-path lsp/Cargo.toml --target "$TARGET"
+
+      - name: Verify
+        if: ${{ matrix.native }}
+        run: |
+          reported="$("$BINARY" --version | tr -d '\r')"
+          if [ "$reported" != "microtypo-lsp ${REF#v}" ]; then
+            echo "::error::the binary reports a different version"
+            exit 1
+          fi
+
+      - name: Package
+        run: |
+          mkdir dist
+          cp "$BINARY" "dist/$ASSET"
+
+      - name: Upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: binary-${{ matrix.asset }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  provenance:
+    name: Provenance
+    needs:
+      - gates
+      - build
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      attestations: write
+      id-token: write
+    outputs:
+      sums_sha256: ${{ steps.package.outputs.sums_sha256 }}
+    steps:
+      - name: Download
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: binary-*
+          path: release
+          merge-multiple: true
+
+      - name: Package
+        id: package
+        working-directory: release
+        run: |
+          if [ "$(find . -type f -name 'microtypo-lsp-*' | wc -l)" -ne 6 ]; then
+            echo "::error::the release set is incomplete"
+            exit 1
+          fi
+          sha256sum microtypo-lsp-* > SHA256SUMS
+          echo "sums_sha256=$(sha256sum SHA256SUMS | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+
+      - name: Sign
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: release/*
+
+      - name: Upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-set
+          path: release/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  publish:
+    name: Publish
+    needs:
+      - identity
+      - provenance
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REF: ${{ github.ref_name }}
+      REPOSITORY: ${{ github.repository }}
+      SOURCE_COMMIT: ${{ needs.identity.outputs.source_commit }}
+      SUMS_SHA256: ${{ needs.provenance.outputs.sums_sha256 }}
+    steps:
+      - name: Download
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-set
+          path: release
+
+      - name: Verify
+        working-directory: release
+        run: |
+          if [ "$(sha256sum SHA256SUMS | cut -d ' ' -f 1)" != "$SUMS_SHA256" ]; then
+            echo "::error::publication input is not the signed set"
+            exit 1
+          fi
+          sha256sum --check --strict SHA256SUMS
+          if [ "$(find . -type f | wc -l)" -ne 7 ]; then
+            echo "::error::publication input holds files other than the signed set"
+            exit 1
+          fi
+
+      - name: Draft
+        run: |
+          if gh release view "$REF" --repo "$REPOSITORY" > /dev/null 2>&1; then
+            echo "::error::release already exists; refusing to overwrite it"
+            exit 1
+          fi
+          gh release create "$REF" release/* --repo "$REPOSITORY" --verify-tag \
+            --target "$SOURCE_COMMIT" --draft --title "$REF" --generate-notes
+
+      - name: Readback
+        run: |
+          mkdir readback
+          gh release download "$REF" --repo "$REPOSITORY" --dir readback
+          diff --recursive release readback
+
+      - name: Publish
+        run: gh release edit "$REF" --repo "$REPOSITORY" --draft=false --latest
+
+  immutability:
+    name: Immutability
+    needs:
+      - identity
+      - provenance
+      - publish
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      attestations: read
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REF: ${{ github.ref_name }}
+      REPOSITORY: ${{ github.repository }}
+      SOURCE_COMMIT: ${{ needs.identity.outputs.source_commit }}
+      SUMS_SHA256: ${{ needs.provenance.outputs.sums_sha256 }}
+    steps:
+      - name: Download
+        run: |
+          mkdir -p "$RUNNER_TEMP/release"
+          gh release download "$REF" --repo "$REPOSITORY" --dir "$RUNNER_TEMP/release"
+
+      - name: Verify
+        working-directory: ${{ runner.temp }}/release
+        run: |
+          if [ "$(sha256sum SHA256SUMS | cut -d ' ' -f 1)" != "$SUMS_SHA256" ]; then
+            echo "::error::published release identity differs"
+            exit 1
+          fi
+          sha256sum --check --strict SHA256SUMS
+          for attempt in {1..30}; do
+            if gh release verify "$REF" --repo "$REPOSITORY"; then
+              break
+            fi
+            if [ "$attempt" -eq 30 ]; then
+              echo "::error::release attestation was not available after 30 attempts"
+              exit 1
+            fi
+            sleep 2
+          done
+          for asset in *; do
+            gh release verify-asset "$REF" "$asset" --repo "$REPOSITORY"
+            gh attestation verify "$asset" --repo "$REPOSITORY" --deny-self-hosted-runners \
+              --signer-workflow "$REPOSITORY/.github/workflows/release.yml" \
+              --source-ref "refs/tags/$REF" --source-digest "$SOURCE_COMMIT"
+          done

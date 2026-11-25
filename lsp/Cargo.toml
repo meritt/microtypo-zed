@@ -1,0 +1,30 @@
+[package]
+name = "microtypo-lsp"
+version = "0.1.1"
+edition = "2024"
+rust-version = "1.100"
+license = "MIT"
+authors = ["Alexey Simonenko <alexey@simonenko.dev>"]
+description = "Language server that applies Russian typography with the microtypo engine"
+repository = "https://github.com/meritt/microtypo-zed"
+publish = false
+
+[workspace]
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+
+[dependencies]
+getrandom = "=0.4.3"
+microtypo-core = { git = "https://github.com/meritt/microtypo.rs", tag = "v0.2.2" }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = { version = "=1.0.154", features = ["preserve_order"] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+strip = true

@@ -1,0 +1,16 @@
+._*
+.DS_Store
+*.local.*
+.worktrees/
+.superpowers/
+*.log
+*.tgz
+dist/
+target/
+
+extension.wasm
+
+docs/plans/*
+docs/specs/*
+docs/superpowers/*
+docs/tasks/*

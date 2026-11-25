@@ -1,0 +1,17 @@
+id = "microtypo-lsp"
+name = "MicroTypo"
+version = "0.1.1"
+schema_version = 1
+authors = ["Alexey Simonenko <alexey@simonenko.dev>"]
+description = "Russian typography for Markdown, MDX, HTML, JSON, YAML, TOML, XML and plain text"
+repository = "https://github.com/meritt/microtypo-zed"
+
+[language_servers.microtypo]
+name = "MicroTypo"
+languages = ["Markdown", "MDX", "HTML", "JSON", "YAML", "TOML", "XML", "Plain Text"]
+code_action_kinds = ["refactor.rewrite.microtypo"]
+
+[[capabilities]]
+kind = "download_file"
+host = "github.com"
+path = ["meritt", "microtypo-zed", "releases", "download", "**"]

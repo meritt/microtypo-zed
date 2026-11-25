@@ -1,0 +1,166 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_call:
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    concurrency:
+      group: ci-test-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+    permissions:
+      contents: read
+    env:
+      CARGO_INCREMENTAL: 0
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Restore
+        id: restore
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+            lsp/target/
+          key: test-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('lsp/rust-toolchain.toml', 'Cargo.toml') }}-${{ hashFiles('Cargo.lock', 'lsp/Cargo.lock') }}
+          restore-keys: test-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('lsp/rust-toolchain.toml', 'Cargo.toml') }}-
+
+      - name: Setup
+        run: |
+          channel="$(sed -n 's/^channel = "\(.*\)"$/\1/p' lsp/rust-toolchain.toml)"
+          floor="$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)"
+          rustup toolchain install "$channel" --profile minimal --component clippy --component rustfmt --target wasm32-wasip2
+          rustup toolchain install "$floor" --profile minimal --target wasm32-wasip2
+          {
+            echo "RUSTUP_TOOLCHAIN=$channel"
+            echo "EXTENSION_TOOLCHAIN=$floor"
+          } >> "$GITHUB_ENV"
+
+      - name: Install
+        env:
+          CARGO_DENY_SHA256: 98c56e6a408bfa5c3c60744b6015aaa6aa08f743fdeb88386d06fca035bb1786
+          GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+        run: |
+          fetch() {
+            curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 --output "$2" "$1"
+          }
+          mkdir -p "$RUNNER_TEMP/bin"
+          deny="$RUNNER_TEMP/cargo-deny.tar.gz"
+          fetch https://github.com/EmbarkStudios/cargo-deny/releases/download/0.22.0/cargo-deny-0.22.0-x86_64-unknown-linux-musl.tar.gz "$deny"
+          echo "$CARGO_DENY_SHA256  $deny" | sha256sum -c - > /dev/null
+          tar -xzf "$deny" -C "$RUNNER_TEMP/bin" --strip-components 1 cargo-deny-0.22.0-x86_64-unknown-linux-musl/cargo-deny
+          leaks="$RUNNER_TEMP/gitleaks.tar.gz"
+          fetch https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz "$leaks"
+          echo "$GITLEAKS_SHA256  $leaks" | sha256sum -c - > /dev/null
+          tar -xzf "$leaks" -C "$RUNNER_TEMP/bin" gitleaks
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Format
+        run: |
+          cargo fmt --check
+          cargo fmt --manifest-path lsp/Cargo.toml --check
+
+      - name: Lint
+        env:
+          CARGO_BUILD_WARNINGS: deny
+        run: |
+          cargo clippy --all-targets --locked
+          cargo clippy --locked --target wasm32-wasip2
+          cargo clippy --manifest-path lsp/Cargo.toml --all-targets --locked
+
+      - name: Audit
+        run: |
+          cargo deny --locked check
+          cargo deny --manifest-path lsp/Cargo.toml --locked check
+
+      - name: Secrets
+        run: |
+          mkdir -p "$RUNNER_TEMP/source"
+          git archive HEAD | tar -x -C "$RUNNER_TEMP/source"
+          gitleaks dir --redact --no-banner --timeout 300 \
+            --max-target-megabytes 64 "$RUNNER_TEMP/source"
+
+      - name: Test
+        run: |
+          cargo test --locked
+          cargo test --manifest-path lsp/Cargo.toml --locked
+
+      - name: Build
+        run: |
+          RUSTUP_TOOLCHAIN="$EXTENSION_TOOLCHAIN" cargo build --release --locked --target wasm32-wasip2
+          cargo build --release --locked --manifest-path lsp/Cargo.toml
+
+      - name: Save
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.restore.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+            lsp/target/
+          key: ${{ steps.restore.outputs.cache-primary-key }}
+
+  platforms:
+    name: Platforms
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    concurrency:
+      group: ci-platforms-${{ matrix.target }}-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: macos-26, target: aarch64-apple-darwin, native: true }
+          - { runner: macos-26, target: x86_64-apple-darwin, native: false }
+          - { runner: ubuntu-26.04, target: x86_64-unknown-linux-musl, native: true }
+          - { runner: ubuntu-26.04-arm, target: aarch64-unknown-linux-musl, native: true }
+          - { runner: windows-2025, target: x86_64-pc-windows-msvc, native: true }
+          - { runner: windows-11-arm, target: aarch64-pc-windows-msvc, native: true }
+    env:
+      CARGO_INCREMENTAL: 0
+      TARGET: ${{ matrix.target }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup
+        run: |
+          channel="$(sed -n 's/^channel = "\(.*\)"$/\1/p' lsp/rust-toolchain.toml | tr -d '\r')"
+          rustup toolchain install "$channel" --profile minimal --target "$TARGET"
+          echo "RUSTUP_TOOLCHAIN=$channel" >> "$GITHUB_ENV"
+
+      - name: Test
+        if: ${{ matrix.native }}
+        run: cargo test --manifest-path lsp/Cargo.toml --locked --target "$TARGET"
+
+      - name: Build
+        if: ${{ !matrix.native }}
+        run: cargo build --manifest-path lsp/Cargo.toml --locked --target "$TARGET"
